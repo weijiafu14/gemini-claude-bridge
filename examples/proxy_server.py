@@ -1,36 +1,37 @@
 """
-Minimal Gemini-Claude bridge proxy server.
-
-Receives Anthropic Claude Messages API requests and proxies them to Google Gemini,
-converting protocols in both directions.
+Claude Code compatible proxy server — use Gemini as Claude backend.
 
 Usage:
+    # Minimal
     GEMINI_API_KEY=your-key python examples/proxy_server.py
 
-    # Then point Claude Code at the proxy:
+    # Then in another terminal:
     ANTHROPIC_BASE_URL=http://localhost:8082 claude
 
+    # With model mapping
+    GEMINI_API_KEY=your-key BIG_MODEL=gemini-2.5-pro SMALL_MODEL=gemini-2.5-flash python examples/proxy_server.py
+
 Environment variables:
-    GEMINI_API_KEY      - Google Gemini API key (required)
-    GEMINI_MODEL        - Model name (default: gemini-2.5-flash-preview-04-17)
-    GEMINI_API_BASE_URL - API base URL (default: https://generativelanguage.googleapis.com)
-    PORT                - Server port (default: 8082)
+    GEMINI_API_KEY        - Google Gemini API key (required)
+    GEMINI_API_BASE_URL   - API base (default: https://generativelanguage.googleapis.com)
+    BIG_MODEL             - Model for opus/sonnet requests (default: gemini-2.5-flash)
+    SMALL_MODEL           - Model for haiku requests (default: gemini-2.5-flash)
+    ANTHROPIC_API_KEY     - If set, proxy validates incoming requests against this key
+    PORT                  - Server port (default: 8082)
 """
 
 import os
 import sys
 import json
 import uuid
-import asyncio
 import logging
 from typing import Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import StreamingResponse, JSONResponse
 
-# Add parent directory to path so we can import the library
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from gemini_claude_bridge import (
@@ -47,19 +48,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger("proxy")
 
-app = FastAPI(title="Gemini-Claude Bridge Proxy")
+app = FastAPI(title="gemini-claude-bridge proxy")
 
-# Configuration
+# --- Configuration ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-preview-04-17")
-GEMINI_API_BASE_URL = os.environ.get("GEMINI_API_BASE_URL", "https://generativelanguage.googleapis.com")
+GEMINI_API_BASE_URL = os.environ.get(
+    "GEMINI_API_BASE_URL",
+    "https://generativelanguage.googleapis.com",
+)
+BIG_MODEL = os.environ.get("BIG_MODEL", "gemini-2.5-flash")
+SMALL_MODEL = os.environ.get("SMALL_MODEL", "gemini-2.5-flash")
 
-# Global signature manager (persists thoughtSignatures across requests)
+# Optional: if set, clients must send this exact key as x-api-key / Authorization
+PROXY_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Signature persistence
 signature_manager = GeminiSignatureManager()
 
 
-def _get_gemini_url(model: str, stream: bool) -> str:
-    """Build Gemini API URL."""
+# --- Model mapping ---
+
+def _resolve_model(claude_model: str) -> str:
+    """
+    Map Claude model name to Gemini model name.
+
+    Claude Code sends model names like:
+      claude-sonnet-4-20250514, claude-opus-4-20250514, claude-haiku-3.5-20241022
+    We map by family: opus/sonnet → BIG_MODEL, haiku → SMALL_MODEL.
+    """
+    m = claude_model.lower()
+    if "haiku" in m:
+        return SMALL_MODEL
+    # opus, sonnet, or anything else → big model
+    return BIG_MODEL
+
+
+# --- Auth ---
+
+def _check_auth(request: Request) -> Optional[JSONResponse]:
+    """Validate API key if ANTHROPIC_API_KEY is configured."""
+    if not PROXY_API_KEY:
+        return None  # no auth required
+
+    # Claude Code sends: x-api-key header or Authorization: Bearer xxx
+    api_key = request.headers.get("x-api-key", "")
+    if not api_key:
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            api_key = auth[7:]
+
+    if api_key != PROXY_API_KEY:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "type": "error",
+                "error": {"type": "authentication_error", "message": "Invalid API key"},
+            },
+        )
+    return None
+
+
+# --- Gemini HTTP ---
+
+def _gemini_url(model: str, stream: bool) -> str:
     action = "streamGenerateContent" if stream else "generateContent"
     url = f"{GEMINI_API_BASE_URL}/v1beta/models/{model}:{action}"
     if stream:
@@ -67,13 +118,20 @@ def _get_gemini_url(model: str, stream: bool) -> str:
     return url
 
 
+# --- Endpoints ---
+
 @app.post("/v1/messages")
-async def messages_endpoint(request: Request):
-    """Claude Messages API compatible endpoint."""
+async def messages(request: Request):
+    """Anthropic Messages API compatible endpoint."""
+    # Auth
+    auth_err = _check_auth(request)
+    if auth_err:
+        return auth_err
+
     if not GEMINI_API_KEY:
         return JSONResponse(
             status_code=500,
-            content={"error": "GEMINI_API_KEY not set"},
+            content={"type": "error", "error": {"type": "api_error", "message": "GEMINI_API_KEY not configured"}},
         )
 
     body = await request.json()
@@ -82,81 +140,109 @@ async def messages_endpoint(request: Request):
     try:
         claude_request = ClaudeMessagesRequest(**body)
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}},
+        )
 
+    gemini_model = _resolve_model(claude_request.model)
     is_stream = claude_request.stream or False
     session_id = request.headers.get("x-session-id", "default")
     project_path = request.headers.get("x-project-path", "default")
 
-    # Convert Claude request to Gemini format
     gemini_request = convert_claude_to_gemini(
         request=claude_request,
-        model=GEMINI_MODEL,
+        model=gemini_model,
         signature_manager=signature_manager,
         session_id=session_id,
         project_path=project_path,
         stream=is_stream,
     )
 
-    logger.info(f"[{request_id}] {'Stream' if is_stream else 'Non-stream'} request: model={GEMINI_MODEL}")
+    logger.info(
+        f"[{request_id}] {claude_request.model} → {gemini_model} "
+        f"{'stream' if is_stream else 'sync'}"
+    )
 
     if is_stream:
-        return await _handle_stream(request_id, gemini_request, claude_request, session_id, project_path)
+        return await _handle_stream(request_id, gemini_model, gemini_request, claude_request, session_id, project_path)
     else:
-        return await _handle_non_stream(request_id, gemini_request, claude_request, session_id, project_path)
+        return await _handle_sync(request_id, gemini_model, gemini_request, claude_request, session_id, project_path)
 
 
-async def _handle_non_stream(
+@app.post("/v1/count_tokens")
+async def count_tokens(request: Request):
+    """Token counting endpoint (stub — returns estimate)."""
+    auth_err = _check_auth(request)
+    if auth_err:
+        return auth_err
+    body = await request.json()
+    # Rough estimate: 4 chars per token
+    text = json.dumps(body.get("messages", []))
+    return JSONResponse(content={"input_tokens": max(1, len(text) // 4)})
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "big_model": BIG_MODEL,
+        "small_model": SMALL_MODEL,
+    }
+
+
+# --- Handlers ---
+
+async def _handle_sync(
     request_id: str,
+    gemini_model: str,
     gemini_request: dict,
     claude_request: ClaudeMessagesRequest,
     session_id: str,
     project_path: str,
 ) -> JSONResponse:
-    """Handle non-streaming request."""
-    url = _get_gemini_url(GEMINI_MODEL, stream=False)
+    url = _gemini_url(gemini_model, stream=False)
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-
-    # Remove stream field from request body (Gemini doesn't use it)
     payload = {k: v for k, v in gemini_request.items() if k != "stream"}
 
     async with httpx.AsyncClient(timeout=300) as client:
         resp = await client.post(url, json=payload, headers=headers)
 
     if resp.status_code != 200:
-        logger.error(f"[{request_id}] Gemini error {resp.status_code}: {resp.text[:500]}")
-        return JSONResponse(status_code=resp.status_code, content={"error": resp.text})
+        logger.error(f"[{request_id}] Gemini {resp.status_code}: {resp.text[:500]}")
+        return JSONResponse(
+            status_code=502,
+            content={"type": "error", "error": {"type": "api_error", "message": f"Gemini returned {resp.status_code}"}},
+        )
 
-    gemini_response = resp.json()
     claude_response = convert_gemini_to_claude(
-        gemini_response=gemini_response,
+        gemini_response=resp.json(),
         original_request=claude_request,
         signature_manager=signature_manager,
         session_id=session_id,
         project_path=project_path,
     )
 
-    logger.info(f"[{request_id}] Response: {len(claude_response.get('content', []))} blocks")
+    logger.info(f"[{request_id}] → {len(claude_response.get('content', []))} blocks")
     return JSONResponse(content=claude_response)
 
 
 async def _handle_stream(
     request_id: str,
+    gemini_model: str,
     gemini_request: dict,
     claude_request: ClaudeMessagesRequest,
     session_id: str,
     project_path: str,
 ) -> StreamingResponse:
-    """Handle streaming request."""
-    url = _get_gemini_url(GEMINI_MODEL, stream=True)
+    url = _gemini_url(gemini_model, stream=True)
     headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
-
     payload = {k: v for k, v in gemini_request.items() if k != "stream"}
 
     async def sse_generator():
         converter = GeminiStreamConverter(
             request_id=request_id,
-            model=GEMINI_MODEL,
+            model=gemini_model,
             original_request_model=claude_request.model,
             signature_manager=signature_manager,
             session_id=session_id,
@@ -167,16 +253,11 @@ async def _handle_stream(
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
-                    logger.error(f"[{request_id}] Gemini stream error {resp.status_code}: {error_body[:500]}")
-                    error_event = json.dumps({
-                        "type": "error",
-                        "error": {"type": "api_error", "message": error_body.decode()[:500]},
-                    })
-                    yield f"event: error\ndata: {error_event}\n\n"
+                    logger.error(f"[{request_id}] Gemini stream {resp.status_code}: {error_body[:500]}")
+                    yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'api_error','message':error_body.decode()[:500]}})}\n\n"
                     return
 
                 async def ndjson_lines():
-                    """Parse SSE or NDJSON lines from Gemini response."""
                     buffer = ""
                     async for chunk in resp.aiter_text():
                         buffer += chunk
@@ -185,7 +266,6 @@ async def _handle_stream(
                             line = line.strip()
                             if not line:
                                 continue
-                            # Handle SSE format (data: {...})
                             if line.startswith("data: "):
                                 line = line[6:]
                             if line.startswith("{"):
@@ -197,23 +277,14 @@ async def _handle_stream(
     return StreamingResponse(
         sse_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Request-Id": request_id,
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Request-Id": request_id},
     )
-
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "model": GEMINI_MODEL}
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8082"))
-    logger.info(f"Starting proxy: port={port}, model={GEMINI_MODEL}")
     if not GEMINI_API_KEY:
-        logger.error("GEMINI_API_KEY environment variable is required!")
+        logger.error("Set GEMINI_API_KEY environment variable")
         sys.exit(1)
+    logger.info(f"Starting on :{port}  big={BIG_MODEL}  small={SMALL_MODEL}")
     uvicorn.run(app, host="0.0.0.0", port=port)

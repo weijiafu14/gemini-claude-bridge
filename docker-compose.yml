@@ -1,0 +1,13 @@
+services:
+  proxy:
+    build: .
+    ports:
+      - "8082:8082"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_API_BASE_URL=${GEMINI_API_BASE_URL:-https://generativelanguage.googleapis.com}
+      - BIG_MODEL=${BIG_MODEL:-gemini-2.5-flash}
+      - SMALL_MODEL=${SMALL_MODEL:-gemini-2.5-flash}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - PORT=8082
+    restart: unless-stopped
