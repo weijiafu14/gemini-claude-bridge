@@ -39,6 +39,7 @@ def convert_claude_to_gemini(
     project_path: Optional[str] = None,
     stream: bool = False,
     system_instruction_prefix: Optional[str] = None,
+    multimodal_tool_results: bool = True,
 ) -> Dict[str, Any]:
     """
     Convert a Claude Messages API request to Gemini API format.
@@ -51,6 +52,9 @@ def convert_claude_to_gemini(
         project_path: Project path for signature lookup.
         stream: Whether to enable streaming.
         system_instruction_prefix: Optional text to prepend to system instruction.
+        multimodal_tool_results: If True, embed images in functionResponse.parts.
+            Set to False for models that don't support multimodal function responses
+            (e.g. gemini-2.5-flash). Images will be described as text instead.
 
     Returns:
         Gemini API format request dict.
@@ -72,6 +76,14 @@ def convert_claude_to_gemini(
         if dummy_signature_tool_ids:
             logger.info(f"Replaying {len(dummy_signature_tool_ids)} tool calls with dummy signature")
 
+    # Auto-detect multimodal support if not explicitly set
+    # gemini-3-* supports multimodal function responses, gemini-2.5-* does not
+    if multimodal_tool_results:
+        model_lower = model.lower() if model else ""
+        if "2.5" in model_lower or "2.0" in model_lower:
+            multimodal_tool_results = False
+            logger.info(f"Auto-disabled multimodal_tool_results for model: {model}")
+
     # 3. Convert messages to contents
     contents: List[Dict[str, Any]] = []
     for msg in request.messages:
@@ -79,6 +91,7 @@ def convert_claude_to_gemini(
             msg, tool_id_to_name, signature_manager,
             session_id, project_path,
             skipped_tool_ids, dummy_signature_tool_ids,
+            multimodal_tool_results=multimodal_tool_results,
         )
         if converted:
             contents.append(converted)
@@ -301,6 +314,7 @@ def _convert_message(
     project_path: Optional[str] = None,
     skipped_tool_ids: Optional[Set[str]] = None,
     dummy_signature_tool_ids: Optional[Set[str]] = None,
+    multimodal_tool_results: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Convert a single Claude message to Gemini format."""
     role = "model" if msg.role == Constants.ROLE_ASSISTANT else msg.role
@@ -309,6 +323,7 @@ def _convert_message(
         msg.content, tool_id_to_name, signature_manager,
         session_id, project_path,
         skipped_tool_ids, dummy_signature_tool_ids,
+        multimodal_tool_results=multimodal_tool_results,
     )
 
     if not parts:
@@ -325,6 +340,7 @@ def _convert_content_to_parts(
     project_path: Optional[str] = None,
     skipped_tool_ids: Optional[Set[str]] = None,
     dummy_signature_tool_ids: Optional[Set[str]] = None,
+    multimodal_tool_results: bool = True,
 ) -> List[Dict[str, Any]]:
     """Convert Claude content blocks to Gemini parts."""
     parts: List[Dict[str, Any]] = []
@@ -399,7 +415,14 @@ def _convert_content_to_parts(
 
             tool_name = tool_id_to_name.get(tool_use_id, tool_use_id)
 
-            text_result, image_parts_from_result = parse_tool_result_content_with_images(tool_content)
+            if multimodal_tool_results:
+                text_result, image_parts_from_result = parse_tool_result_content_with_images(tool_content)
+            else:
+                # For models that don't support multimodal function responses,
+                # parse as text only (images become "[Image: ...]" placeholders)
+                from .image_utils import parse_tool_result_content
+                text_result = parse_tool_result_content(tool_content)
+                image_parts_from_result = []
 
             function_response: Dict[str, Any] = {
                 "name": tool_name,

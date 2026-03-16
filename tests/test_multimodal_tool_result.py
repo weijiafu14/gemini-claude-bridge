@@ -66,7 +66,7 @@ class TestMultimodalToolResult:
         sig_mgr.store("sess", "/proj", "call_1", "sig_1")
 
         result = convert_claude_to_gemini(
-            req, "gemini-2.5-flash",
+            req, "gemini-3-flash-preview",
             signature_manager=sig_mgr, session_id="sess", project_path="/proj",
         )
 
@@ -121,7 +121,7 @@ class TestMultimodalToolResult:
         sig_mgr.store("sess", "/proj", "call_2", "sig_2")
 
         result = convert_claude_to_gemini(
-            req, "gemini-2.5-flash",
+            req, "gemini-3-flash-preview",
             signature_manager=sig_mgr, session_id="sess", project_path="/proj",
         )
 

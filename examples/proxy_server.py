@@ -209,7 +209,15 @@ async def _handle_sync(
         resp = await client.post(url, json=payload, headers=headers)
 
     if resp.status_code != 200:
-        logger.error(f"[{request_id}] Gemini {resp.status_code}: {resp.text[:500]}")
+        logger.error(f"[{request_id}] Gemini {resp.status_code}: {resp.text[:1000]}")
+        logger.error(f"[{request_id}] Sent payload keys: {list(payload.keys())}, contents count: {len(payload.get('contents',[]))}")
+        import json as _j
+        for i, c in enumerate(payload.get('contents', [])):
+            parts_summary = []
+            for p in c.get('parts', []):
+                pk = list(p.keys())
+                parts_summary.append(pk)
+            logger.error(f"[{request_id}]   contents[{i}] role={c.get('role')} parts={parts_summary}")
         return JSONResponse(
             status_code=502,
             content={"type": "error", "error": {"type": "api_error", "message": f"Gemini returned {resp.status_code}"}},
